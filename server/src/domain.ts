@@ -88,6 +88,29 @@ export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' |
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
 export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
+export function voyageContext(voyageId: string) {
+  const voyage = voyages.find(item => item.id === voyageId);
+  if (!voyage) return undefined;
+  const voyageContainers = containers.filter(item => item.voyageId === voyageId);
+  const containerIds = new Set(voyageContainers.map(item => item.id));
+  const countBy = (key: 'status' | 'direction' | 'size') => voyageContainers.reduce<Record<string, number>>((acc, item) => { acc[item[key]] = (acc[item[key]] ?? 0) + 1; return acc; }, {});
+  const stats = {
+    total: voyageContainers.length,
+    byStatus: countBy('status'),
+    byDirection: countBy('direction'),
+    bySize: countBy('size'),
+    reefer: voyageContainers.filter(item => item.reefer).length,
+    hazmat: voyageContainers.filter(item => item.hazmatClass).length,
+    customsHeld: voyageContainers.filter(item => item.customs !== 'released').length
+  };
+  const openTasks = prioritizeTasks().filter(task => containerIds.has(task.containerId) && task.status !== 'done');
+  const voyageAppointments = appointments.filter(item => containerIds.has(item.containerId));
+  const appointmentIds = new Set(voyageAppointments.map(item => item.id));
+  const conflicts = gateConflicts().filter(conflict => appointmentIds.has(conflict.appointmentId));
+  const blockIds = new Set(voyageContainers.map(item => parseSlot(item.yardSlot)).filter((id): id is string => Boolean(id)));
+  const yardBlocks = yardHeatmap().filter(block => blockIds.has(block.id)).sort((a, b) => b.heat - a.heat);
+  return { voyage, stats, containers: voyageContainers, openTasks, appointments: voyageAppointments, conflicts, yardBlocks };
+}
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
 export type AppointmentInput = Pick<GateAppointment, 'containerId' | 'truckNo' | 'driver' | 'type' | 'windowStart' | 'windowEnd' | 'lane'>;

@@ -4,6 +4,33 @@ test('gate conflict engine detects same truck overlap', () => { const conflicts 
 test('yard planner respects reefer and hazmat constraints', () => { const plan = containerPlan('TGHU-9831204'); assert.equal(plan?.recommendedBlock?.hazmatAllowed, true); assert.ok(plan?.reasons.some(reason => reason.includes('危险品'))); });
 test('priority queue promotes customs inspection work', () => { const tasks = prioritizeTasks(); assert.equal(tasks[0].containerId, 'TGHU-9831204'); });
 
+test('voyage context aggregates containers, tasks, conflicts and yard pressure for one voyage', async () => {
+  const { voyageContext } = await import('./domain.js');
+  const context = voyageContext('VOY-AX7');
+  assert.ok(context);
+  assert.equal(context.voyage.id, 'VOY-AX7');
+  assert.ok(context.stats.total > 0);
+  assert.ok(context.containers.every(item => item.voyageId === 'VOY-AX7'));
+  assert.ok(context.openTasks.length > 0);
+  assert.ok(context.openTasks.every(task => task.status !== 'done' && context.containers.some(item => item.id === task.containerId)));
+  assert.ok(context.conflicts.some(item => item.appointmentId === 'APT-9001'));
+  assert.ok(context.conflicts.every(item => context.appointments.some(appointment => appointment.id === item.appointmentId)));
+  assert.ok(context.yardBlocks.length > 0);
+  for (let index = 1; index < context.yardBlocks.length; index += 1) assert.ok(context.yardBlocks[index - 1].heat >= context.yardBlocks[index].heat);
+});
+
+test('voyage context returns empty collections for voyages without linked data and undefined for unknown voyages', async () => {
+  const { voyageContext } = await import('./domain.js');
+  assert.equal(voyageContext('VOY-NONE'), undefined);
+  const departed = voyageContext('VOY-RD8');
+  assert.ok(departed);
+  assert.equal(departed.stats.total, 0);
+  assert.equal(departed.openTasks.length, 0);
+  assert.equal(departed.appointments.length, 0);
+  assert.equal(departed.conflicts.length, 0);
+  assert.equal(departed.yardBlocks.length, 0);
+});
+
 test('container create, update and delete form a complete audited CRUD cycle', async () => {
   const { createContainer, updateContainer, deleteContainer, containers } = await import('./domain.js');
   const created = createContainer({ id: 'TEST-CRUD-0001', voyageId: 'VOY-AX7', size: '20', isoType: '22G1', direction: 'import', status: 'in-yard', weightT: 10, reefer: false, customs: 'released', priority: 'normal', yardSlot: 'C03-R11-T1' });
