@@ -12,6 +12,8 @@ type Section = 'control'|'containers'|'gate'|'yard'|'tasks';
 type Editor = { entity: 'container'|'appointment'|'task'; mode: 'create'|'edit'; id?: string; values: Record<string, string|boolean> };
 
 const api = '/api';
+const VOYAGE_STORAGE_KEY = 'harborgrid.selectedVoyage';
+const readStoredVoyage = () => { try { return localStorage.getItem(VOYAGE_STORAGE_KEY) ?? ''; } catch { return ''; } };
 const pct = (value: number) => `${Math.round(value * 100)}%`;
 const time = (value: string) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const toLocalInput = (value?: string) => {
@@ -41,7 +43,7 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [equipment, setEquipment] = useState<Equipment[]>([]);
   const [tab, setTab] = useState<Section>('control');
-  const [selectedVoyage, setSelectedVoyage] = useState('VOY-AX7');
+  const [selectedVoyage, setSelectedVoyage] = useState(() => readStoredVoyage() || 'VOY-AX7');
   const [editor, setEditor] = useState<Editor>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -56,6 +58,11 @@ export default function App() {
     setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e);
   }, []);
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }, [load]);
+  const selectVoyage = (id: string) => {
+    setSelectedVoyage(id);
+    try { localStorage.setItem(VOYAGE_STORAGE_KEY, id); } catch { /* 存储不可用时仅保留会话内选择 */ }
+  };
+  useEffect(() => { if (voyages.length > 0 && !voyages.some(voyage => voyage.id === selectedVoyage)) selectVoyage(voyages[0].id); }, [voyages, selectedVoyage]);
 
   const mutate = async (path: string, method: string, body?: unknown) => {
     setBusy(true); setError('');
@@ -65,7 +72,12 @@ export default function App() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败'); }
     finally { setBusy(false); }
   };
-  const openCreate = (entity: Editor['entity']) => { setError(''); setEditor({ entity, mode: 'create', values: defaultValues(entity) }); };
+  const openCreate = (entity: Editor['entity']) => {
+    setError('');
+    const values = defaultValues(entity);
+    if (entity === 'container' && voyages.some(voyage => voyage.id === selectedVoyage)) values.voyageId = selectedVoyage;
+    setEditor({ entity, mode: 'create', values });
+  };
   const openEdit = (entity: Editor['entity'], id: string, values: Record<string, string|boolean>) => { setError(''); setEditor({ entity, mode: 'edit', id, values: { ...values } }); };
   const updateField = (key: string, value: string|boolean) => setEditor(current => current ? { ...current, values: { ...current.values, [key]: value } } : current);
   const saveEditor = async (event: FormEvent) => {
@@ -93,8 +105,31 @@ export default function App() {
   };
   const updateAppointmentStatus = async (id: string, status: string) => mutate(`/gate/appointments/${id}`, 'PATCH', { status });
   const assign = async (id: string, equipmentId: string) => equipmentId ? mutate(`/tasks/${id}/assign`, 'PATCH', { equipmentId }) : mutate(`/tasks/${id}`, 'PATCH', { equipmentId: '', status: 'queued' });
-  const selected = voyages.find(voyage => voyage.id === selectedVoyage);
+  const selected = voyages.find(voyage => voyage.id === selectedVoyage) ?? voyages[0];
+  const voyageId = selected?.id;
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
+  const voyageContainers = useMemo(() => containers.filter(container => container.voyageId === voyageId), [containers, voyageId]);
+  const voyageContainerIds = useMemo(() => new Set(voyageContainers.map(container => container.id)), [voyageContainers]);
+  const directionStats = useMemo(() => {
+    const stats: Record<Container['direction'], number> = { import: 0, export: 0, transshipment: 0 };
+    voyageContainers.forEach(container => { stats[container.direction] += 1; });
+    return stats;
+  }, [voyageContainers]);
+  const reeferCount = voyageContainers.filter(container => container.reefer).length;
+  const hazmatCount = voyageContainers.filter(container => container.hazmatClass).length;
+  const customsPending = voyageContainers.filter(container => container.customs !== 'released').length;
+  const voyageAppointments = useMemo(() => appointments.filter(appointment => voyageContainerIds.has(appointment.containerId)), [appointments, voyageContainerIds]);
+  const voyageAppointmentIds = useMemo(() => new Set(voyageAppointments.map(appointment => appointment.id)), [voyageAppointments]);
+  const voyageConflicts = useMemo(() => conflicts.filter(conflict => voyageAppointmentIds.has(conflict.appointmentId)), [conflicts, voyageAppointmentIds]);
+  const voyageTasks = useMemo(() => tasks.filter(task => voyageContainerIds.has(task.containerId) && task.status !== 'done' && (task.priority >= 80 || task.status === 'blocked')).sort((a, b) => b.score - a.score).slice(0, 4), [tasks, voyageContainerIds]);
+  const voyageBlocks = useMemo(() => {
+    const counts = new Map<string, number>();
+    voyageContainers.forEach(container => {
+      const blockId = container.yardSlot.match(/^([A-Z]\d\d)-/)?.[1];
+      if (blockId) counts.set(blockId, (counts.get(blockId) ?? 0) + 1);
+    });
+    return blocks.filter(block => counts.has(block.id)).map(block => ({ ...block, voyageBoxes: counts.get(block.id) ?? 0 })).sort((a, b) => b.heat - a.heat).slice(0, 3);
+  }, [blocks, voyageContainers]);
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
 
   if (!dashboard && error) return <main className="connection-error"><div className="eyebrow">API CONNECTION ERROR</div><h1>无法连接港口作业服务</h1><p>{error}</p><p>请从项目根目录运行 <code>npm run dev</code>，确认前端 5178 和 API 4107 均已启动。</p><button onClick={() => { setError(''); void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }}>重新连接</button></main>;
@@ -105,7 +140,32 @@ export default function App() {
     {message && <div className="toast" onClick={() => setMessage('')}>{message} ×</div>}{error && <div className="form-error page-error">{error}<button onClick={() => setError('')}>关闭</button></div>}
     <section className="kpis"><div><small>ACTIVE VESSELS</small><b>{dashboard.activeVoyages}<em> 艘</em></b><span>{dashboard.lateVessels} 艘存在延误风险</span></div><div><small>YARD UTILIZATION</small><b>{pct(dashboard.yardUtilization)}</b><span>可用堆位 / 危险品隔离纳管</span></div><div><small>GATE QUEUE</small><b>{dashboard.gateQueue}<em> 车</em></b><span>预约、已进场与车道排队</span></div><div><small>EXCEPTIONS</small><b>{dashboard.blockedTasks + dashboard.reeferAlerts + dashboard.hazmatHolds}<em> 项</em></b><span>{dashboard.blockedTasks} 作业阻塞 · {dashboard.reeferAlerts} 冷藏告警</span></div></section>
     <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
-    {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
+    {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${voyageId===voyage.id?'selected':''}`} onClick={() => selectVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>航次策略</strong><span>{voyageId} 当前有 {voyageTasks.length} 个高优先级任务待完成、{voyageConflicts.length} 起预约冲突、{customsPending} 箱海关未放行；优先保护冷藏与危险品安全约束。</span></div></section>
+    <section className="panel wide voyage-context">
+      <div className="panel-head"><div><div className="eyebrow">VOYAGE CONTEXT / {voyageId ?? '—'}</div><h2>航次作业上下文</h2><span className="muted">箱务、任务、闸口与堆场均按 {voyageId} 过滤，与上方所选航次保持一致</span></div><span className="scope-tag">同一航次视图</span></div>
+      <div className="context-grid">
+        <div className="context-card">
+          <div className="context-head"><h3>箱量分布</h3><span>{voyageContainers.length} 箱</span></div>
+          {voyageContainers.length === 0 ? <div className="empty-state">该航次暂无关联箱务记录<small>可在「箱务台账」新增箱务并关联 {voyageId}</small></div> : <>
+            {(['import', 'export', 'transshipment'] as const).map(direction => <div className="dist-row" key={direction}><span>{direction === 'import' ? '进口' : direction === 'export' ? '出口' : '中转'}</span><div className="dist-bar"><i style={{ width: `${directionStats[direction] / voyageContainers.length * 100}%` }}/></div><b>{directionStats[direction]}</b></div>)}
+            <div className="context-tags"><span>冷藏 {reeferCount}</span><span>危险品 {hazmatCount}</span><span className={customsPending > 0 ? 'warn' : ''}>海关未放行 {customsPending}</span></div>
+          </>}
+        </div>
+        <div className="context-card">
+          <div className="context-head"><h3>未完成高优先级任务</h3><span>{voyageTasks.length} 项</span></div>
+          {voyageTasks.length === 0 ? <div className="empty-state">没有未完成的高优先级任务<small>优先级 ≥ 80 或阻塞中的任务会出现在这里</small></div> : voyageTasks.map(task => <div className="ctx-item" key={task.id}><div><b>{task.id} · {task.kind}</b><small>{task.containerId} → {task.to}</small>{task.blockingReasons.length > 0 && <small className="blocked-text">{task.blockingReasons[0]}</small>}</div><span className={`pill ${task.status}`}>{task.status}</span><strong className={task.score > 95 ? 'critical' : ''}>{task.score}</strong></div>)}
+        </div>
+        <div className="context-card">
+          <div className="context-head"><h3>关联预约冲突</h3><span>{voyageConflicts.length} 起</span></div>
+          {voyageConflicts.length === 0 ? <div className="empty-state ok">该航次预约暂无冲突<small>{voyageAppointments.length} 个关联预约窗口正常</small></div> : voyageConflicts.map((conflict, index) => <div className="ctx-item conflict-item" key={`${conflict.appointmentId}-${index}`}><strong className={conflict.severity}>{conflict.severity}</strong><div><b>{conflict.appointmentId}</b><small>{conflict.reason}</small></div></div>)}
+        </div>
+        <div className="context-card">
+          <div className="context-head"><h3>最紧迫堆场区块</h3><span>按热度排序</span></div>
+          {voyageBlocks.length === 0 ? <div className="empty-state">该航次箱量尚未落入堆场区块<small>箱务台账中的堆位会在此汇总压力</small></div> : voyageBlocks.map(block => <div className="ctx-item" key={block.id}><i className={`block-dot ${block.pressure}`}/><div><b>{block.id} · {block.zone}</b><small>本航次 {block.voyageBoxes} 箱 · 空位 {block.freeSlots} · 冷插 {block.usedPlugs}/{block.reeferPlugs}</small></div><strong className={block.pressure === 'critical' ? 'critical' : block.pressure === 'warning' ? 'warning' : 'ok'}>{pct(block.utilization)}</strong></div>)}
+        </div>
+      </div>
+    </section>
+    <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GLOBAL SIGNALS / 全港范围</div><h3>异常与联动信号</h3></div><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
